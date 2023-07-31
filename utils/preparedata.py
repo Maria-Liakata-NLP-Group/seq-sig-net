@@ -7,29 +7,32 @@ class PrepareData:
     """
     model_specifics: dict
         dictionary of specified model options
-    zero_padding: boolean
-        if True, we pad by 0s, if False we pad by the last data point
-    w_last: boolean
-        if True we pad the last w posts, if False we pad as much as the maximum timeline in the dataset
+    time_column: list or str, optional
+        contains the name of time features. default: 'time_encoding'
+    zero_padding: boolean, optional
+        if True, we pad by 0s, if False we pad by the last data point. default: True
+    w_last: boolean, optional
+        if True we pad the last w posts, if False we pad as much as the maximum timeline in the dataset. default: True
     """
     def __init__(self, model_specifics, time_column = 'time_encoding', zero_padding=True, w_last=True):
-        self.w = model_specifics["w"]
-        self.k = model_specifics["k"]
-        self.n = model_specifics["n"]
-        self.m = self.k * self.n + (self.w - self.k)
-        self.dim_reduction = model_specifics['dimensionality_reduction']
-        self.post_embedding_tp = model_specifics['post_embedding_tp']
-        self.time_injection_post_tp = model_specifics['time_injection_post_tp']
+        self.pad_window = model_specifics["w"] if "w" in model_specifics.keys() else model_specifics["history_len"] if "history_len" in model_specifics.keys() else 10
+        self.k = model_specifics["k"] if "k" in model_specifics.keys() else None
+        self.n = model_specifics["n"] if "n" in model_specifics.keys() else None
+        self.dim_reduction = model_specifics['dimensionality_reduction'] if "dimensionality_reduction" in model_specifics.keys() else None
+        self.post_embedding_tp = model_specifics['post_embedding_tp'] if "post_embedding_tp" in model_specifics.keys() else None
+        self.time_injection_post_tp = model_specifics['time_injection_post_tp'] if "time_injection_post_tp" in model_specifics.keys() else None
         self.zero_padding = zero_padding
         self.w_last = w_last
-        self.time_column = time_column
-    
+        self.time_column = time_column if ((isinstance(time_column, list)) | (time_column==None)) else [time_column]
+        self.pad_with = model_specifics["pad_with"] if "pad_with" in model_specifics.keys() else 0
+        
+
     def pad(self, df):
 
         #sort dataframe (in case it is not sorted already)
         df = df.sort_values(by=['timeline_id', 'datetime']).reset_index(drop=True)
 
-        #keep reduced or origina embeddings?
+        #keep reduced or original embeddings?
         if (self.dim_reduction==True) :
             emb_str = "^d\w*[0-9]"
         else:
@@ -37,13 +40,16 @@ class PrepareData:
 
         id_counts = df.groupby(['timeline_id'])['timeline_id'].count()
         time_n = id_counts.max()
-        df_new = np.array(df[['timeline_id','label']+[self.time_column]+[c for c in df.columns if re.match(emb_str, c)]])
-
+        if self.time_column == None:
+            df_new = np.array(df[['timeline_id','label']+[c for c in df.columns if re.match(emb_str, c)]])
+        else:
+            df_new = np.array(df[['timeline_id','label']+ self.time_column +[c for c in df.columns if re.match(emb_str, c)]])
+        
         #iterate to create slices
         start_i = 0
         end_i = 0
         dims = df_new.shape[1]
-        zeros = np.concatenate(( np.array([100]), np.repeat(0,dims-2) ),axis=0)
+        zeros = np.concatenate(( np.array([100]), np.repeat(self.pad_with, dims-2) ),axis=0)
         sample_list = []
 
         for i in range(df.shape[0]):
@@ -53,8 +59,8 @@ class PrepareData:
                 i_prev = i-1
             if (df['timeline_id'][i]==df['timeline_id'][i_prev]):
                 end_i +=1
-                if ((self.w_last==True) & ((end_i - start_i) > self.w)):
-                    start_i = end_i - self.w
+                if ((self.w_last==True) & ((end_i - start_i) > self.pad_window)):
+                    start_i = end_i - self.pad_window
             else: 
                 start_i = i
                 end_i = i+1
@@ -63,7 +69,7 @@ class PrepareData:
             df_add = df_new[start_i:end_i, 1:][np.newaxis, :, :]
             #padding length
             if (self.w_last == True):
-                padding_n = self.w - (end_i- start_i) 
+                padding_n = self.pad_window - (end_i- start_i) 
             else:
                 padding_n = time_n - (end_i- start_i) 
             #create padding
@@ -78,9 +84,10 @@ class PrepareData:
         
         return df, np.concatenate(sample_list)
     
-    def unit_input(self, df, df_padded):
+    def unit_input(self, df, df_padded, embeddings_lastdim=False):
         #torch conversion and removal of label and time dimensions
-        path = torch.from_numpy(df_padded[: , : , 2:].astype(float))
+        exclude_ind = 1 + (0 if (self.time_column==None) else len(self.time_column))
+        path = torch.from_numpy(df_padded[: , : , exclude_ind:].astype(float))
         
         #get time feature and standardise it (if defined)
         if (self.time_injection_post_tp == 'timestamp'):
@@ -92,9 +99,9 @@ class PrepareData:
 
         #get current post (if defined)
         if (self.post_embedding_tp == 'sentence'):
-            bert_embeddings = torch.tensor(df[[c for c in df.columns if re.match("^e\w*[0-9]", c)]].values).unsqueeze(2).repeat(1, 1, self.w)
+            bert_embeddings = torch.tensor(df[[c for c in df.columns if re.match("^e\w*[0-9]", c)]].values).unsqueeze(2).repeat(1, 1, self.pad_window)
         elif (self.post_embedding_tp == 'reduced'):
-            bert_embeddings = torch.tensor(df[[c for c in df.columns if re.match("^d\w*[0-9]", c)]].values).unsqueeze(2).repeat(1, 1, self.w)
+            bert_embeddings = torch.tensor(df[[c for c in df.columns if re.match("^d\w*[0-9]", c)]].values).unsqueeze(2).repeat(1, 1, self.pad_window)
         else:
             bert_embeddings = None
 
@@ -106,6 +113,9 @@ class PrepareData:
             x_data = torch.cat((x_data, time_feature), dim=1)
         if (bert_embeddings != None):
             x_data = torch.cat((x_data, bert_embeddings), dim=1)
+        
+        if embeddings_lastdim:
+            x_data = torch.transpose(x_data, 1,2)
 
         return x_data
     
